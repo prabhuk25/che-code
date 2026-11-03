@@ -16,8 +16,6 @@ ARG GITHUB_TOKEN=''
 ENV GITHUB_TOKEN=$GITHUB_TOKEN
 
 # Unset GITHUB_TOKEN environment variable if it is empty.
-# This is needed for some tools which use this variable and will fail with 401 Unauthorized error if it is invalid.
-# For example, vscode ripgrep downloading is an example of such case.
 RUN if [ -z $GITHUB_TOKEN ]; then unset GITHUB_TOKEN; fi
 
 # Install libsecret-devel on s390x and ppc64le for keytar build (binary included in npm package for x86)
@@ -57,6 +55,9 @@ RUN { if [[ $(uname -m) == "s390x" ]]; then LIBSECRET="\
 #
 #########################################################
 COPY code /checode-compilation
+COPY build/scripts/ppc64le-compat.sh /usr/local/bin/ppc64le-compat.sh
+RUN chmod +x /usr/local/bin/ppc64le-compat.sh
+
 WORKDIR /checode-compilation
 ENV ELECTRON_SKIP_BINARY_DOWNLOAD=1 \
     PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 \
@@ -66,37 +67,8 @@ ENV ELECTRON_SKIP_BINARY_DOWNLOAD=1 \
 # Initialize a git repository for code build tools
 RUN git init .
 
-# prepareBuiltInCopilotRipgrepShim has no unsupported-arch guard unlike other
-# copilot functions. Patch it to skip gracefully on ppc64le/s390x.
-# hadolint ignore=SC3014
-RUN if [ "$(uname -m)" != "x86_64" ] && [ "$(uname -m)" != "aarch64" ]; then \
-      sed -i 's/export function prepareBuiltInCopilotRipgrepShim(platform: string, arch: string, builtInCopilotExtensionDir: string, appNodeModulesDir: string): void {/export function prepareBuiltInCopilotRipgrepShim(platform: string, arch: string, builtInCopilotExtensionDir: string, appNodeModulesDir: string): void {\n\tif (!copilotPlatforms.includes(toCopilotPackagePlatformArch(platform, arch))) { return; }/' \
-        build/lib/copilot.ts; \
-    fi
-
 # change network timeout (slow using multi-arch build)
 RUN npm config set fetch-retry-mintimeout 100000 && npm config set fetch-retry-maxtimeout 600000
-
-# @vscode/vsce-sign and @github/copilot have no binary for ppc64le/s390x.
-# Disable their postinstall scripts before npm install.
-# hadolint ignore=SC3014
-RUN if [ "$(uname -m)" != "x86_64" ] && [ "$(uname -m)" != "aarch64" ]; then \
-      sed -i '/@vscode\/vsce-sign/,/\}/s/"hasInstallScript": true/"hasInstallScript": false/' \
-        build/package-lock.json \
-        extensions/copilot/package-lock.json; \
-      sed -i 's/"postinstall": "tsx \.\/script\/postinstall\.ts"/"postinstall": "echo skipped"/' \
-        extensions/copilot/package.json; \
-    fi
-
-# On ppc64le/s390x, build_from_source in remote/.npmrc causes node-gyp to
-# download headers from nodejs.org which times out. Disable it and also
-# disable @parcel/watcher install script since no prebuilt exists for ppc64le.
-# hadolint ignore=SC3014
-RUN if [ "$(uname -m)" != "x86_64" ] && [ "$(uname -m)" != "aarch64" ]; then \
-      sed -i '/^build_from_source/d' remote/.npmrc; \
-      sed -i '0,/"hasInstallScript": true/s/"hasInstallScript": true/"hasInstallScript": false/' \
-        remote/package-lock.json; \
-    fi
 
 # node-gyp's make generator execs gyp entrypoints via shebang; UBI npm may
 # ship them without +x and with a stale Python shebang (e.g. python3.8)
@@ -107,19 +79,14 @@ RUN chmod +x \
       /usr/lib/node_modules/npm/node_modules/node-gyp/gyp/gyp_main.py \
       /usr/lib/node_modules/npm/node_modules/node-gyp/gyp/gyp
 
+# Run pre-install compatibility patches (patches copilot.ts, cleans npmrc, disables install scripts)
+RUN /usr/local/bin/ppc64le-compat.sh pre-install
+
 # Grab dependencies (and force to rebuild them)
 RUN rm -rf /checode-compilation/node_modules && npm install --force
 
-# tsgo has no native binary for ppc64le/s390x - replace with a no-op.
-# Must run AFTER npm install so node_modules/.bin/tsgo exists.
-# hadolint ignore=SC3014
-RUN if [ "$(uname -m)" != "x86_64" ] && [ "$(uname -m)" != "aarch64" ]; then \
-      find . -path "*/node_modules/.bin/tsgo" | while read f; do \
-        echo '#!/bin/sh' > "$f"; \
-        echo 'exit 0' >> "$f"; \
-        chmod +x "$f"; \
-      done; \
-    fi
+# Run post-install compatibility patches (stubs tsgo, disables vsce-sign in node_modules)
+RUN /usr/local/bin/ppc64le-compat.sh post-install
 
 # Compile
 RUN NODE_ARCH=$(echo "console.log(process.arch)" | node) \
@@ -129,10 +96,10 @@ RUN NODE_ARCH=$(echo "console.log(process.arch)" | node) \
     && echo "caching /checode-compilation/.build/node/v${NODE_VERSION}/linux-${NODE_ARCH}/node" \
     && cp /usr/bin/node /checode-compilation/.build/node/v${NODE_VERSION}/linux-${NODE_ARCH}/node \
     && if [ "$(uname -m)" = "x86_64" ] || [ "$(uname -m)" = "aarch64" ]; then \
-    NODE_OPTIONS="--max-old-space-size=8192" ./node_modules/.bin/gulp copy-codicons compile-non-native-extensions-build compile-copilot-extension-build compile-extension-media-build; \
-    else \
-    NODE_OPTIONS="--max-old-space-size=8192" ./node_modules/.bin/gulp copy-codicons compile-non-native-extensions-build compile-extension-media-build; \
-    fi \
+         NODE_OPTIONS="--max-old-space-size=8192" ./node_modules/.bin/gulp copy-codicons compile-non-native-extensions-build compile-copilot-extension-build compile-extension-media-build; \
+       else \
+         NODE_OPTIONS="--max-old-space-size=8192" ./node_modules/.bin/gulp copy-codicons compile-non-native-extensions-build compile-extension-media-build; \
+       fi \
     && npx tsgo --project src/tsconfig.json --noEmit --skipLibCheck \
     && NODE_OPTIONS="--max-old-space-size=8192" node build/next/index.ts bundle --minify --nls --mangle-privates --target server-web --out out-vscode-reh-web-min \
     && NODE_OPTIONS="--max-old-space-size=8192" ./node_modules/.bin/gulp vscode-reh-web-linux-${NODE_ARCH}-min-ci \
@@ -163,16 +130,14 @@ RUN ./node_modules/.bin/gulp compile-extension:vscode-api-tests \
 	compile-extension:git \
 	compile-extension:ipynb \
 	compile-extension-media \
-  compile-extension:configuration-editing
+    compile-extension:configuration-editing
 
 # Compile test suites
-# https://github.com/microsoft/vscode/blob/cdde5bedbf3ed88f93b5090bb3ed9ef2deb7a1b4/test/integration/browser/README.md#compile
 RUN if [ "$(uname -m)" = "x86_64" ]; then npm --prefix test/smoke run compile && npm --prefix test/integration/browser run compile; fi
 
 # install test dependencies
 ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=0
 RUN if [ "$(uname -m)" = "x86_64" ]; then npm run playwright-install; fi
-# Install procps to manage to kill processes and centos stream repository
 RUN if [ "$(uname -m)" = "x86_64" ]; then \
       ARCH=$(uname -m) && \
       yum install --nobest -y procps \
@@ -229,4 +194,3 @@ RUN npm install \
 # Store the content of the result
 FROM scratch as linux-libc-content
 COPY --from=linux-libc-ubi8-builder /checode /checode-linux-libc/ubi8
-
