@@ -39,6 +39,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 #
 #########################################################
 COPY code /checode-compilation
+COPY build/scripts/ppc64le-compat.sh /usr/local/bin/ppc64le-compat.sh
+RUN chmod +x /usr/local/bin/ppc64le-compat.sh
+
 WORKDIR /checode-compilation
 
 ENV ELECTRON_SKIP_BINARY_DOWNLOAD=1
@@ -48,8 +51,6 @@ ENV VSCODE_SKIP_HEADER_INSTALL=1
 # workaround for https://github.com/nodejs/node/issues/52229
 # GCC 15 in Alpine 3.24 requires nullptr_t to be explicitly declared;
 # Node.js v24's V8 headers use bare nullptr_t without std:: qualification.
-# A macro-based fix (-Dnullptr_t=...) breaks std::nullptr_t via recursive substitution,
-# so we create a header that uses a proper using-declaration instead.
 RUN printf '#include <cstddef>\nusing nullptr_t = std::nullptr_t;\n' > /usr/local/include/fix_nullptr.h
 ENV CXXFLAGS='-DNODE_API_EXPERIMENTAL_NOGC_ENV_OPT_OUT -include /usr/local/include/fix_nullptr.h'
 
@@ -59,68 +60,17 @@ RUN git init .
 # change network timeout (slow using multi-arch build)
 RUN npm config set fetch-retry-mintimeout 100000 && npm config set fetch-retry-maxtimeout 600000
 
-# prepareBuiltInCopilotRipgrepShim has no unsupported-arch guard unlike other
-# copilot functions. Patch it to skip gracefully on ppc64le/s390x.
-# hadolint ignore=SC3014
-RUN if [ "${TARGETARCH}" != "amd64" ] && [ "${TARGETARCH}" != "arm64" ]; then \
-      sed -i 's/export function prepareBuiltInCopilotRipgrepShim(platform: string, arch: string, builtInCopilotExtensionDir: string, appNodeModulesDir: string): void {/export function prepareBuiltInCopilotRipgrepShim(platform: string, arch: string, builtInCopilotExtensionDir: string, appNodeModulesDir: string): void {\n\tif (!copilotPlatforms.includes(toCopilotPackagePlatformArch(platform, arch))) { return; }/' \
-        build/lib/copilot.ts; \
-    fi
-
-# The root .npmrc sets runtime=electron and disturl=electronjs.org for desktop builds.
-# On ppc64le/s390x we build the web server only — write global npmrc overrides so
-# node-gyp uses plain Node headers. Project .npmrc is left intact for build tools.
-# hadolint ignore=SC3014
-RUN if [ "${TARGETARCH}" != "amd64" ] && [ "${TARGETARCH}" != "arm64" ]; then \
-      printf 'runtime=node\ndisturl=https://nodejs.org/dist\nbuild_from_source=false\n' \
-        >> /root/.npmrc; \
-    fi
-
-# @vscode/vsce-sign and @github/copilot have no binary for ppc64le/s390x.
-# Disable their postinstall scripts before npm install.
-# hadolint ignore=SC3014
-RUN if [ "${TARGETARCH}" != "amd64" ] && [ "${TARGETARCH}" != "arm64" ]; then \
-      sed -i '/@vscode\/vsce-sign/,/\}/s/"hasInstallScript": true/"hasInstallScript": false/' \
-        build/package-lock.json \
-        extensions/copilot/package-lock.json; \
-      sed -i 's/"postinstall": "tsx \.\/script\/postinstall\.ts"/"postinstall": "echo skipped"/' \
-        extensions/copilot/package.json; \
-    fi
-
-# On ppc64le/s390x, build_from_source in remote/.npmrc causes node-gyp to
-# download headers from nodejs.org which times out. Disable it and also
-# disable @parcel/watcher install script since no prebuilt exists for ppc64le.
-# hadolint ignore=SC3014
-RUN if [ "${TARGETARCH}" != "amd64" ] && [ "${TARGETARCH}" != "arm64" ]; then \
-      sed -i '/^build_from_source/d' remote/.npmrc; \
-      sed -i '0,/"hasInstallScript": true/s/"hasInstallScript": true/"hasInstallScript": false/' \
-        remote/package-lock.json; \
-    fi
+# Run pre-install compatibility patches (patches copilot.ts, cleans npmrc, disables install scripts)
+RUN /usr/local/bin/ppc64le-compat.sh pre-install
 
 # Grab dependencies (and force to rebuild them)
 RUN rm -rf /checode-compilation/node_modules && npm install --force
 
-# Disable @vscode/vsce-sign postinstall in installed node_modules for unsupported architectures.
-# npm install unpacks the package fresh, so the patch must be applied after install and before rebuild.
-# hadolint ignore=SC3014
-RUN if [ "${TARGETARCH}" != "amd64" ] && [ "${TARGETARCH}" != "arm64" ]; then \
-      find . -path "*/node_modules/@vscode/vsce-sign/package.json" -exec \
-        sed -i 's/"postinstall": "node \.\/src\/postinstall\.js"/"postinstall": "echo skipped"/' {} +; \
-    fi
+# Run post-install compatibility patches (stubs tsgo, disables vsce-sign in node_modules)
+RUN /usr/local/bin/ppc64le-compat.sh post-install
 
 # Rebuild platform specific dependencies
 RUN npm rebuild
-
-# tsgo has no native binary for ppc64le/s390x - replace it with a no-op so
-# type-check steps (noEmit only) are skipped gracefully during the build.
-# hadolint ignore=SC3014
-RUN if [ "${TARGETARCH}" != "amd64" ] && [ "${TARGETARCH}" != "arm64" ]; then \
-      find . -path "*/node_modules/.bin/tsgo" | while read f; do \
-        echo '#!/bin/sh' > "$f"; \
-        echo 'exit 0' >> "$f"; \
-        chmod +x "$f"; \
-      done; \
-    fi
 
 # Cache node binary with architecture-specific path
 RUN NODE_VERSION=$(cat /checode-compilation/remote/.npmrc | grep target | cut -d '=' -f 2 | tr -d '"') \
@@ -271,4 +221,3 @@ RUN npm install \
 
 FROM scratch as linux-musl-content
 COPY --from=linux-musl-builder /checode /checode-linux-musl
-
